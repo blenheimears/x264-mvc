@@ -998,6 +998,7 @@ static void help( x264_param_t *defaults, int longhelp )
     H0( "      --mvc-no-inter-i/p/b      Disable I, P, or B cross-view prediction individually\n" );
     H0( "      --mvc-inter-i/p/b         Re-enable I, P, or B individually\n" );
     H0( "      --mvc-no-joint-ratecontrol  Retain separate target rates in MVC pass 2\n" );
+    H0( "      --mvc-rc-trace <csv>       Log completed picture-pair sizes and combined CPB fill\n" );
     H0( "      --mvc-combined-vbv-maxrate <kbps>  Combined elementary-stream peak rate\n" );
     H0( "      --mvc-combined-vbv-bufsize <kbit>  Combined elementary-stream CPB size\n" );
     H0( "      MVC --pass 1/2 uses --stats.base and --stats.dependent; pass 1 emits no video\n" );
@@ -1056,6 +1057,7 @@ typedef enum
     OPT_MVC_NO_INTER_P,
     OPT_MVC_NO_INTER_B,
     OPT_MVC_NO_JOINT_RATECONTROL,
+    OPT_MVC_RC_TRACE,
     OPT_MVC_COMBINED_VBV_MAXRATE,
     OPT_MVC_COMBINED_VBV_BUFSIZE,
     OPT_MVC_SERIAL,
@@ -1081,6 +1083,7 @@ static struct option long_options[] =
     { "mvc-no-inter-p",       no_argument,       NULL, OPT_MVC_NO_INTER_P },
     { "mvc-no-inter-b",       no_argument,       NULL, OPT_MVC_NO_INTER_B },
     { "mvc-no-joint-ratecontrol", no_argument, NULL, OPT_MVC_NO_JOINT_RATECONTROL },
+    { "mvc-rc-trace", required_argument, NULL, OPT_MVC_RC_TRACE },
     { "mvc-combined-vbv-maxrate", required_argument, NULL, OPT_MVC_COMBINED_VBV_MAXRATE },
     { "mvc-combined-vbv-bufsize", required_argument, NULL, OPT_MVC_COMBINED_VBV_BUFSIZE },
     { "mvc-serial",           no_argument,       NULL, OPT_MVC_SERIAL },
@@ -1372,7 +1375,7 @@ static int select_input( const char *demuxer, char *used_demuxer, char *filename
     return 0;
 }
 
-static int init_vid_filters( char *sequence, hnd_t *handle, video_info_t *info, x264_param_t *param, int output_csp )
+static int init_vid_filters( char *sequence, hnd_t *handle, video_info_t *info, x264_param_t *param, int output_csp, int mvc_enabled )
 {
     x264_register_vid_filters();
 
@@ -1409,7 +1412,9 @@ static int init_vid_filters( char *sequence, hnd_t *handle, video_info_t *info, 
     int csp = info->csp & X264_CSP_MASK;
     if( output_csp == X264_CSP_I400 && csp != X264_CSP_I400 )
         param->i_csp = X264_CSP_I400;
-    else if( output_csp == X264_CSP_I420 && (csp < X264_CSP_I420 || csp >= X264_CSP_I422) )
+    else if( output_csp == X264_CSP_I420 &&
+             (mvc_enabled ? csp != X264_CSP_I420 :
+              (csp < X264_CSP_I420 || csp >= X264_CSP_I422)) )
         param->i_csp = X264_CSP_I420;
     else if( output_csp == X264_CSP_I422 && (csp < X264_CSP_I422 || csp >= X264_CSP_I444) )
         param->i_csp = X264_CSP_I422;
@@ -1581,6 +1586,7 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
             case OPT_MVC_NO_INTER_P: b_mvc_option = 1; opt->mvc.prediction_mask &= ~2U; break;
             case OPT_MVC_NO_INTER_B: b_mvc_option = 1; opt->mvc.prediction_mask &= ~4U; break;
             case OPT_MVC_NO_JOINT_RATECONTROL: b_mvc_option = 1; opt->mvc.no_joint_ratecontrol = 1; break;
+            case OPT_MVC_RC_TRACE: b_mvc_option = 1; opt->mvc.rc_trace_filename = optarg; break;
             case OPT_MVC_COMBINED_VBV_MAXRATE:
             case OPT_MVC_COMBINED_VBV_BUFSIZE:
             {
@@ -1910,7 +1916,7 @@ generic_option:
     if( input_opt.input_range != RANGE_AUTO )
         info.fullrange = input_opt.input_range;
 
-    if( init_vid_filters( vid_filters, &opt->hin, &info, param, output_csp ) )
+    if( init_vid_filters( vid_filters, &opt->hin, &info, param, output_csp, opt->mvc.enabled ) )
         return -1;
 
     /* set param flags from the post-filtered video */
@@ -1995,7 +2001,7 @@ generic_option:
             if( !error && !right_handle )
                 error = cli_input.open_file( opt->mvc.right_filename, &right_handle, &right_info, &right_opt );
             if( !error )
-                error = init_vid_filters( NULL, &right_handle, &right_info, &right_param, X264_CSP_I420 );
+                error = init_vid_filters( NULL, &right_handle, &right_info, &right_param, X264_CSP_I420, 1 );
             if( !error )
             {
                 opt->mvc_right_filter = filter;
@@ -2139,11 +2145,14 @@ static int mvc_read_picture( void *opaque, x264_picture_t *dst, int64_t index, i
     x264_picture_init( &pic );
     convert_cli_to_lib_pic( &pic, &source );
     if( (pic.img.i_csp & X264_CSP_MASK) != X264_CSP_I420 ||
-        (pic.img.i_csp & X264_CSP_HIGH_DEPTH) || pic.img.i_plane != 3 )
+        (pic.img.i_csp & X264_CSP_HIGH_DEPTH) || pic.img.i_plane < 3 )
     {
         f->release_frame( hin, &source, source_index );
         return -1;
     }
+    /* An extra plane (e.g. alpha from a container decoder) is not part of MVC.
+     * Only the first three planar I420 planes are copied. */
+    pic.img.i_plane = 3;
     /* The caller allocates a full-sized source picture. Strides may differ
      * due to SIMD alignment; the configured width, not the stride, is copied. */
     int height = right ? opt->mvc_right_height : opt->mvc_source_height;

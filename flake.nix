@@ -9,7 +9,7 @@
         let pkgs = import nixpkgs { inherit system; }; in
         pkgs.stdenv.mkDerivation {
           pname = "x264-mvc";
-          version = "0.1.0-test22-shared-row-vbv-incomplete-test";
+          version = "0.1.0-test23-ntm-input-headers-trace-incomplete-test";
           src = self;
           nativeBuildInputs = with pkgs; [ pkg-config python3 ]
             ++ lib.optionals stdenv.hostPlatform.isx86_64 [ nasm ];
@@ -41,6 +41,7 @@
           checkPhase = ''
             runHook preCheck
             python3 tests/test_stock_cli_mvc.py ./x264
+            python3 tests/test_ntm_integration.py ./x264
             cc -std=c99 -I. tests/test_mvc_joint_rc.c mvc/joint_rc.c -lm -o mvc-joint-rc-test
             ./mvc-joint-rc-test
             cc -std=c99 -I. -include config.h tests/test_mvc_shared_vbv.c mvc/shared_vbv.c -lm -lpthread -o mvc-shared-vbv-test

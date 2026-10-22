@@ -19,6 +19,7 @@ typedef struct {
     int serial_mode; /* Disables cross-view producer/consumer overlap, for diagnostics. */
     int pipeline_depth; /* Bounded in-flight jobs, 1..8 (default 3). */
     /* 0 inherits the corresponding stock x264 rate-control parameter. */
+    const char *rc_trace_filename; /* Completed decode-order pair CSV; optional. */
     int no_joint_ratecontrol; /* Preserve explicitly requested independent targets on pass 2. */
     int dependent_bitrate;
     int dependent_vbv_maxrate;

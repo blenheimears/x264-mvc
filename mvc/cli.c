@@ -13,7 +13,7 @@
 #include "../common/osdep.h"
 #include "../common/cpu.h"
 
-typedef struct { x264_t *encoder; x264_param_t param; } mvc_view_t;
+typedef struct { x264_t *encoder; x264_param_t param; int level; } mvc_view_t;
 
 static int mvc_open( mvc_view_t *view, const x264_param_t *source, unsigned mask,
                      int dependent, const x264_mvc_cli_opts_t *opt, int width, int height, int view_threads,
@@ -61,7 +61,8 @@ static int mvc_open( mvc_view_t *view, const x264_param_t *source, unsigned mask
     p->b_mvc_inter_view_b = dependent && !!(mask & 4);
     p->b_full_recon = !dependent && !!mask;
     p->b_annexb = 1;
-    p->b_repeat_headers = 0;
+    /* Repeat SPS/PPS (subset SPS for dependent view) at every IDR for seeking. */
+    p->b_repeat_headers = 1;
     p->b_open_gop = 0;
     /* Both encoders ingest pictures in display order. Their non-adaptive
      * B-picture decisions and closed GOP cadence match, while reconstructed
@@ -121,6 +122,7 @@ static int mvc_headers( mvc_view_t *view, FILE *out, int dependent, unsigned mas
         int sc = p[2] == 1 ? 3 : 4;
         if( nals[i].i_payload > sc + 3 ) level = p[sc+3];
     }
+    view->level = level;
     return x264_mvc_write_nals( out, nals, count, dependent, level, mask );
 }
 /* MVC picture-pipeline threading: x264 owns intra-view frame threading.
@@ -233,9 +235,10 @@ fail:
 typedef struct {
     mvc_view_t *dependent;
     mvc_job_t *pending_head, *pending_tail;
-    FILE *out, *depout;
+    FILE *out, *depout, *trace;
     int stats_only;
     unsigned mask;
+    int level;
     int64_t written;
     x264_mvc_hrd_t hrd;
     int combined_hrd;
@@ -303,9 +306,13 @@ static int mvc_pair_feed( mvc_pair_state_t *s, x264_picture_t *input )
                        " (remaining %.0f bits); encoding aborted\n", s->written, s->hrd.fill_bits);
         return -1;
     }
+    if( s->trace && fprintf( s->trace, "%" PRId64 ",%d,%d,%d,%.3f\n",
+            s->written, base_job->base_size, size, base_job->base_size + size,
+            s->combined_hrd ? s->hrd.fill_bits / 1000.0 : -1.0 ) < 0 )
+        return -1;
     if( !s->stats_only &&
         (x264_mvc_write_nals( s->out, base_job->nals, base_job->nal_count, 0, 40, s->mask ) ||
-         x264_mvc_write_nals( s->depout, dep_nals, dep_count, 1, 40, s->mask )) )
+         x264_mvc_write_nals( s->depout, dep_nals, dep_count, 1, s->level, s->mask )) )
         return -1;
     s->pending_head = base_job->next;
     if( !s->pending_head ) s->pending_tail = NULL;
@@ -454,7 +461,7 @@ int x264_mvc_cli_encode( const x264_param_t *param, const x264_mvc_cli_opts_t *o
     mvc_pipeline_t pipeline = {0};
     int pipeline_started = 0;
 #endif
-    FILE *output = NULL, *dependent_output = NULL;
+    FILE *output = NULL, *dependent_output = NULL, *trace = NULL;
     mvc_view_t base = {0}, dependent = {0};
     x264_picture_t src = {0}, src_right = {0}, left = {0}, right = {0};
     x264_param_t settings;
@@ -562,6 +569,20 @@ int x264_mvc_cli_encode( const x264_param_t *param, const x264_mvc_cli_opts_t *o
                        "buffer (%d kb/s, %d kbit; frame-thread reservations)\n",
                 opt->combined_vbv_maxrate, opt->combined_vbv_bufsize);
     }
+    if( opt->rc_trace_filename && !stats_only )
+    {
+        if( !strcmp( opt->rc_trace_filename, "-" ) ||
+            !strcmp( opt->rc_trace_filename, opt->output_filename ) ||
+            (opt->dependent_filename &&
+             !strcmp( opt->rc_trace_filename, opt->dependent_filename )) )
+        {
+            fprintf( stderr, "x264 MVC: trace path conflicts with video output\n" );
+            goto done;
+        }
+        trace = fopen( opt->rc_trace_filename, "wb" );
+        if( !trace || fprintf( trace, "pair,base_bytes,dependent_bytes,total_bytes,cpb_fill_kbit\n" ) < 0 )
+            goto done;
+    }
     output = stats_only ? NULL : (!strcmp( opt->output_filename, "-" ) ? stdout : fopen( opt->output_filename, "wb" ));
     if( !stats_only && !output ) goto done;
     dependent_output = output;
@@ -597,9 +618,11 @@ int x264_mvc_cli_encode( const x264_param_t *param, const x264_mvc_cli_opts_t *o
     pair.depout = dependent_output;
     pair.mask = opt->prediction_mask;
     pair.stats_only = stats_only;
+    pair.trace = trace;
     if(combined_hrd) { pair.hrd=aggregate; pair.combined_hrd=1; }
     if( !stats_only && (mvc_headers( &base, output, 0, opt->prediction_mask ) ||
         mvc_headers( &dependent, dependent_output, 1, opt->prediction_mask )) ) goto done;
+    pair.level = base.level;
 #if HAVE_THREAD
     /* Until inter-view reference publication has a proper picture lifetime
      * barrier, never run base and dependent encoders simultaneously. Slice
@@ -685,6 +708,7 @@ int x264_mvc_cli_encode( const x264_param_t *param, const x264_mvc_cli_opts_t *o
         if( mvc_pair_drain( &pair ) ) goto done;
         written = pair.written;
     }
+    if( trace && fflush( trace ) ) goto done;
     if( x264_encoder_delayed_frames( dependent.encoder ) || written != submitted ||
         (output && fflush( output )) || (dependent_output && dependent_output != output && fflush( dependent_output )) ) goto done;
     if( shared )
@@ -715,6 +739,7 @@ done:
     if( shared ) x264_mvc_shared_vbv_destroy( shared );
     if( dependent_output && dependent_output != stdout && dependent_output != output ) fclose( dependent_output );
     if( output && output != stdout ) fclose( output );
+    if( trace ) fclose( trace );
     free( base_stats );
     free( dep_stats );
     x264_mvc_joint_plan_clean(&plan);
