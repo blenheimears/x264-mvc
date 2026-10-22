@@ -16,10 +16,15 @@ typedef struct {
     const char *output_filename;
     int user_fps;
     int requested_frames;
+    int serial_mode; /* Disables cross-view producer/consumer overlap, for diagnostics. */
+    int pipeline_depth; /* Bounded in-flight jobs, 1..8 (default 3). */
     /* 0 inherits the corresponding stock x264 rate-control parameter. */
+    int no_joint_ratecontrol; /* Preserve explicitly requested independent targets on pass 2. */
     int dependent_bitrate;
     int dependent_vbv_maxrate;
     int dependent_vbv_bufsize;
+    int combined_vbv_maxrate; /* aggregate elementary-stream peak, kbps */
+    int combined_vbv_bufsize; /* aggregate elementary-stream CPB, kbit */
 } x264_mvc_cli_opts_t;
 /* Returns 0 (picture read), 1 (EOF), -1 (read error). */
 typedef int (*x264_mvc_read_picture)( void *opaque, x264_picture_t *picture, int64_t frame, int right );

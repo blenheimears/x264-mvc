@@ -997,6 +997,12 @@ static void help( x264_param_t *defaults, int longhelp )
     H0( "      --mvc-inter               Enable cross-view prediction for all types (default)\n" );
     H0( "      --mvc-no-inter-i/p/b      Disable I, P, or B cross-view prediction individually\n" );
     H0( "      --mvc-inter-i/p/b         Re-enable I, P, or B individually\n" );
+    H0( "      --mvc-no-joint-ratecontrol  Retain separate target rates in MVC pass 2\n" );
+    H0( "      --mvc-combined-vbv-maxrate <kbps>  Combined elementary-stream peak rate\n" );
+    H0( "      --mvc-combined-vbv-bufsize <kbit>  Combined elementary-stream CPB size\n" );
+    H0( "      MVC --pass 1/2 uses --stats.base and --stats.dependent; pass 1 emits no video\n" );
+    H0( "      --mvc-serial               Disable cross-view pipeline (diagnostics)\n" );
+    H0( "      --mvc-pipeline-depth <1-8>  Bounded pipeline queue (default 3)\n" );
     H0( "      MVC supports raw Annex-B output and progressive 8-bit 4:2:0.\n\n" );
 }
 
@@ -1048,7 +1054,12 @@ typedef enum
     OPT_MVC_INTER_B,
     OPT_MVC_NO_INTER_I,
     OPT_MVC_NO_INTER_P,
-    OPT_MVC_NO_INTER_B
+    OPT_MVC_NO_INTER_B,
+    OPT_MVC_NO_JOINT_RATECONTROL,
+    OPT_MVC_COMBINED_VBV_MAXRATE,
+    OPT_MVC_COMBINED_VBV_BUFSIZE,
+    OPT_MVC_SERIAL,
+    OPT_MVC_PIPELINE_DEPTH
 } OptionsOPT;
 
 static char short_options[] = "8A:B:b:f:hI:i:m:o:p:q:r:t:Vvw";
@@ -1069,6 +1080,11 @@ static struct option long_options[] =
     { "mvc-no-inter-i",       no_argument,       NULL, OPT_MVC_NO_INTER_I },
     { "mvc-no-inter-p",       no_argument,       NULL, OPT_MVC_NO_INTER_P },
     { "mvc-no-inter-b",       no_argument,       NULL, OPT_MVC_NO_INTER_B },
+    { "mvc-no-joint-ratecontrol", no_argument, NULL, OPT_MVC_NO_JOINT_RATECONTROL },
+    { "mvc-combined-vbv-maxrate", required_argument, NULL, OPT_MVC_COMBINED_VBV_MAXRATE },
+    { "mvc-combined-vbv-bufsize", required_argument, NULL, OPT_MVC_COMBINED_VBV_BUFSIZE },
+    { "mvc-serial",           no_argument,       NULL, OPT_MVC_SERIAL },
+    { "mvc-pipeline-depth",   required_argument, NULL, OPT_MVC_PIPELINE_DEPTH },
     { "help",                 no_argument,       NULL, 'h' },
     { "longhelp",             no_argument,       NULL, OPT_LONGHELP },
     { "fullhelp",             no_argument,       NULL, OPT_FULLHELP },
@@ -1564,6 +1580,32 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
             case OPT_MVC_NO_INTER_I: b_mvc_option = 1; opt->mvc.prediction_mask &= ~1U; break;
             case OPT_MVC_NO_INTER_P: b_mvc_option = 1; opt->mvc.prediction_mask &= ~2U; break;
             case OPT_MVC_NO_INTER_B: b_mvc_option = 1; opt->mvc.prediction_mask &= ~4U; break;
+            case OPT_MVC_NO_JOINT_RATECONTROL: b_mvc_option = 1; opt->mvc.no_joint_ratecontrol = 1; break;
+            case OPT_MVC_COMBINED_VBV_MAXRATE:
+            case OPT_MVC_COMBINED_VBV_BUFSIZE:
+            {
+                char *end=NULL;
+                long value;
+                errno=0;
+                value=strtol(optarg,&end,10);
+                FAIL_IF_ERROR( errno || !optarg[0] || *end || value<1 || value>1000000,
+                               "invalid combined MVC VBV parameter `%s'\n", optarg );
+                b_mvc_option=1;
+                if(c==OPT_MVC_COMBINED_VBV_MAXRATE) opt->mvc.combined_vbv_maxrate=value;
+                else opt->mvc.combined_vbv_bufsize=value;
+                break;
+            }
+            case OPT_MVC_SERIAL: b_mvc_option = 1; opt->mvc.serial_mode = 1; break;
+            case OPT_MVC_PIPELINE_DEPTH:
+            {
+                char *end;
+                long value = strtol( optarg, &end, 10 );
+                FAIL_IF_ERROR( !*optarg || *end || value < 1 || value > 8,
+                               "MVC pipeline depth must be between 1 and 8\n" );
+                b_mvc_option = 1;
+                opt->mvc.pipeline_depth = value;
+                break;
+            }
             case 'o':
                 output_filename = optarg;
                 break;
@@ -1720,8 +1762,8 @@ generic_option:
 
     FAIL_IF_ERROR( opt->mvc.enabled && profile && strcasecmp( profile, "high" ),
                    "MVC requires --profile high\n" );
-    FAIL_IF_ERROR( opt->mvc.enabled && (param->rc.b_stat_read || param->rc.b_stat_write),
-                   "MVC two-pass encoding needs separate per-eye stats and is not implemented yet\n" );
+    FAIL_IF_ERROR( opt->mvc.enabled && param->rc.b_stat_read && param->rc.b_stat_write,
+                   "MVC pass 3 is not supported; run --pass 1 then --pass 2\n" );
 
     /* Get the file name */
     FAIL_IF_ERROR( optind > argc - 1 || !output_filename, "No %s file. Run x264 --help for a list of options.\n",

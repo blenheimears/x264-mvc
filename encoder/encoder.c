@@ -3187,6 +3187,10 @@ cont:
     return 0;
 }
 
+/* MVC reference queue is implemented below the normal encoder API. */
+static int mvc_reference_select( x264_t *h );
+static void mvc_reference_queue_clear( x264_t *root );
+
 static void thread_sync_context( x264_t *dst, x264_t *src )
 {
     if( dst == src )
@@ -3286,6 +3290,9 @@ static int threaded_slices_write( x264_t *h )
         {
             t->param = h->param;
             memcpy( &t->i_frame, &h->i_frame, offsetof(x264_t, rc) - offsetof(x264_t, i_frame) );
+            /* MVC reference is deliberately not part of the copied frame-
+             * thread state. Slice workers share the same current picture. */
+            t->mvc_inter_ref = h->mvc_inter_ref;
         }
         int height = h->mb.i_mb_height >> PARAM_INTERLACED;
         t->i_threadslice_start = ((height *  i    + round_bias) / h->param.i_threads) << PARAM_INTERLACED;
@@ -3510,6 +3517,8 @@ int     x264_encoder_encode( x264_t *h,
     /* ------------------- Get frame to be encoded ------------------------- */
     /* 4: get picture to encode */
     h->fenc = x264_frame_shift( h->frames.current );
+    if( mvc_reference_select( h ) )
+        return -1;
 
     /* If applicable, wait for previous frame reconstruction to finish */
     if( h->param.b_sliced_threads )
@@ -4247,6 +4256,13 @@ static int encoder_frame_end( x264_t *h, x264_t *thread_current,
         frame_dump( h );
     x264_emms();
 
+    /* The encoding worker has completed. Recycle this context's MVC ref;
+     * other in-flight frame contexts own their own independent references. */
+    if( h->mvc_inter_ref )
+    {
+        x264_frame_push_unused( h, h->mvc_inter_ref );
+        h->mvc_inter_ref = NULL;
+    }
     return frame_size;
 }
 
@@ -4266,11 +4282,7 @@ static void print_intra( int64_t *i_mb_count, double i_count, int b_print_pcm, c
  ****************************************************************************/
 void    x264_encoder_close  ( x264_t *h )
 {
-    if( h->mvc_inter_ref )
-    {
-        x264_frame_push_unused( h, h->mvc_inter_ref );
-        h->mvc_inter_ref = NULL;
-    }
+    mvc_reference_queue_clear( h->thread[0] );
     int64_t i_yuv_size = FRAME_SIZE( h->param.i_width * h->param.i_height );
     int64_t i_mb_count_size[2][7] = {{0}};
     char buf[200];
@@ -4596,6 +4608,17 @@ void    x264_encoder_close  ( x264_t *h )
     x264_analyse_free_costs( h );
     x264_free( h->cost_table );
 
+    /* On a failed/incomplete encode, frame contexts can still own a base
+     * reference. After all workers have stopped it is safe to recycle them. */
+    for( int i = 0; i < h->i_thread_frames; ++i )
+    {
+        x264_t *ctx = h->thread[i];
+        if( ctx->mvc_inter_ref )
+        {
+            x264_frame_push_unused( ctx, ctx->mvc_inter_ref );
+            ctx->mvc_inter_ref = NULL;
+        }
+    }
     if( h->i_thread_frames > 1 )
         h = h->thread[h->i_thread_phase];
 
@@ -4678,46 +4701,111 @@ int x264_encoder_maximum_delayed_frames( x264_t *h )
     return h->frames.i_delay;
 }
 
-/* x264-mvc: decoded inter-view reference, using the same frame allocation,
- * plane-copy, border expansion and subpixel interpolation as temporal refs. */
-int x264_encoder_mvc_reference( x264_t *h, x264_picture_t *picture )
+/* An output base reconstruction can arrive before the corresponding
+ * dependent frame has emerged from lookahead. Keep timestamp-keyed copies
+ * until x264's normal frame-thread scheduler selects the matching picture.
+ * Queue mutation and frame scheduling take place on the API thread only. */
+typedef struct x264_mvc_ref_node_t
 {
-    if( !h->param.b_mvc_inter_view || h->i_thread_frames != 1 || !picture )
-        return -1;
-    /* This API is called after base encoding, before the next dependent
-     * x264_encoder_encode(). The latter normally waits for outstanding
-     * sliced workers; do it HERE before freeing/reusing their inter-view
-     * reference. Otherwise P/B prediction can race the ref's lifetime. */
-    if( h->param.b_sliced_threads && threadpool_wait_all( h ) < 0 )
-        return -1;
-    if( h->mvc_inter_ref )
+    x264_picture_t pic;
+    struct x264_mvc_ref_node_t *next;
+} x264_mvc_ref_node_t;
+
+static void mvc_reference_queue_clear( x264_t *root )
+{
+    x264_mvc_ref_node_t *cur = root->mvc_ref_queue;
+    while( cur )
     {
-        x264_frame_push_unused( h, h->mvc_inter_ref );
-        h->mvc_inter_ref = NULL;
+        x264_mvc_ref_node_t *next = cur->next;
+        x264_picture_clean( &cur->pic );
+        x264_free( cur );
+        cur = next;
     }
-    x264_frame_t *r = x264_frame_pop_unused( h, 1 );
-    if( !r )
-        return -1;
-    if( x264_frame_copy_picture( h, r, picture ) )
+    root->mvc_ref_queue = NULL;
+    root->mvc_ref_queue_size = 0;
+}
+
+static int mvc_reference_select( x264_t *h )
+{
+    if( !h->param.b_mvc_inter_view )
+        return 0;
+    x264_t *root = h->thread[0];
+    x264_mvc_ref_node_t **link = &root->mvc_ref_queue;
+    while( *link && (*link)->pic.i_pts != h->fenc->i_pts )
+        link = &(*link)->next;
+    if( !*link )
     {
-        x264_frame_push_unused( h, r );
+        x264_log( h, X264_LOG_ERROR, "MVC base view reconstruction missing for PTS %" PRId64 "\n",
+                  h->fenc->i_pts );
         return -1;
     }
-    r->i_frame = (int)picture->i_pts;
-    r->i_lines_completed = INT_MAX;
-    r->b_kept_as_ref = 1;
-    r->i_type = X264_TYPE_P;
-    /* fdec dimensions and chroma layout match the dependent encoder. */
+    x264_mvc_ref_node_t *node = *link;
+    *link = node->next;
+    root->mvc_ref_queue_size--;
+    x264_frame_t *ref = x264_frame_pop_unused( h, 1 );
+    if( !ref )
+    {
+        x264_picture_clean( &node->pic );
+        x264_free( node );
+        return -1;
+    }
+    if( x264_frame_copy_picture( h, ref, &node->pic ) )
+    {
+        x264_frame_push_unused( h, ref );
+        x264_picture_clean( &node->pic );
+        x264_free( node );
+        return -1;
+    }
+    ref->i_pts = node->pic.i_pts;
+    ref->i_frame = (int)ref->i_pts;
+    ref->i_lines_completed = INT_MAX;
+    ref->b_kept_as_ref = 1;
+    ref->i_type = X264_TYPE_P;
     for( int y = 0; y < h->mb.i_mb_height; y++ )
-        x264_frame_expand_border( h, r, y );
+        x264_frame_expand_border( h, ref, y );
     if( h->param.analyse.i_subpel_refine )
-    {
         for( int y = 0; y < h->mb.i_mb_height; y++ )
         {
-            x264_frame_filter( h, r, y, y == h->mb.i_mb_height-1 );
-            x264_frame_expand_border_filtered( h, r, y, y == h->mb.i_mb_height-1 );
+            x264_frame_filter( h, ref, y, y == h->mb.i_mb_height-1 );
+            x264_frame_expand_border_filtered( h, ref, y, y == h->mb.i_mb_height-1 );
         }
+    h->mvc_inter_ref = ref;
+    x264_picture_clean( &node->pic );
+    x264_free( node );
+    return 0;
+}
+
+int x264_encoder_mvc_reference( x264_t *h, x264_picture_t *picture )
+{
+    if( !h->param.b_mvc_inter_view || !picture )
+        return -1;
+    x264_t *root = h->thread[0];
+    if( root->mvc_ref_queue_size >= 256 )
+        return -1; /* bounded even if the dependent encoder stops consuming */
+    for( x264_mvc_ref_node_t *n = root->mvc_ref_queue; n; n = n->next )
+        if( n->pic.i_pts == picture->i_pts )
+            return -1;
+    x264_mvc_ref_node_t *node = x264_malloc( sizeof(*node) );
+    if( !node ) return -1;
+    memset( node, 0, sizeof(*node) );
+    if( x264_picture_alloc( &node->pic, picture->img.i_csp,
+                            root->param.i_width, root->param.i_height ) )
+    {
+        x264_free( node );
+        return -1;
     }
-    h->mvc_inter_ref = r;
+    for( int i = 0; i < picture->img.i_plane; i++ )
+    {
+        int width = root->param.i_width / (i && picture->img.i_plane == 3 ? 2 : 1);
+        int height = root->param.i_height / (i ? 2 : 1);
+        for( int y = 0; y < height; y++ )
+            memcpy( node->pic.img.plane[i] + (size_t)y * node->pic.img.i_stride[i],
+                    picture->img.plane[i] + (size_t)y * picture->img.i_stride[i], width );
+    }
+    node->pic.i_pts = picture->i_pts;
+    x264_mvc_ref_node_t **tail = &root->mvc_ref_queue;
+    while( *tail ) tail = &(*tail)->next;
+    *tail = node;
+    root->mvc_ref_queue_size++;
     return 0;
 }

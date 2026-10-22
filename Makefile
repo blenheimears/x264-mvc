@@ -18,7 +18,7 @@ all: default
 default:
 
 SRCS = common/osdep.c common/base.c common/cpu.c common/tables.c \
-       encoder/api.c
+       encoder/api.c mvc/shared_vbv.c
 
 SRCS_X = common/mc.c common/predict.c common/pixel.c common/macroblock.c \
          common/frame.c common/dct.c common/cabac.c \
@@ -31,7 +31,7 @@ SRCS_X = common/mc.c common/predict.c common/pixel.c common/macroblock.c \
 
 SRCS_8 =
 
-SRCCLI = x264.c mvc/cli.c mvc/nal.c autocomplete.c input/input.c input/timecode.c input/raw.c \
+SRCCLI = x264.c mvc/cli.c mvc/joint_rc.c mvc/nal.c autocomplete.c input/input.c input/timecode.c input/raw.c \
          input/y4m.c output/raw.c output/matroska.c output/matroska_ebml.c \
          output/flv.c output/flv_bytestream.c filters/filters.c \
          filters/video/video.c filters/video/source.c filters/video/internal.c \

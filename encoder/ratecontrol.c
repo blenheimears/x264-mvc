@@ -32,6 +32,7 @@
 #include "common/common.h"
 #include "ratecontrol.h"
 #include "me.h"
+#include "../mvc/shared_vbv.h"
 
 typedef struct
 {
@@ -97,6 +98,10 @@ struct x264_ratecontrol_t
     int64_t buffer_fill_final;
     int64_t buffer_fill_final_min;
     double buffer_fill;         /* planned buffer, if all in-progress frames hit their bit budget */
+    int64_t mvc_shared_order;   /* frame-thread-local shared VBV reservation */
+    int mvc_shared_pending;
+    int mvc_shared_failed;
+    double mvc_shared_allowance;
     double buffer_rate;         /* # of bits added to buffer_fill after each frame */
     double vbv_max_rate;        /* # of bits added to buffer_fill per second */
     predictor_t *pred;          /* predict frame size from satd */
@@ -1115,6 +1120,18 @@ int x264_ratecontrol_new( x264_t *h )
                     rce->frame_type = X264_TYPE_I;
                     rce->pict_type  = SLICE_TYPE_I;
                     break;
+                /* MVC dependent intra pictures may be IDR/I access units
+                 * whose slice is coded as P to reference the other view.
+                 * Preserve the logical picture type for the GOP scheduler
+                 * while keeping the actual P slice for 2pass rate modeling.
+                 * These markers never occur in stock single-view stats. */
+                case 'D':
+                case 'd':
+                    if( !h->param.b_mvc_inter_view_i )
+                        goto parse_error;
+                    rce->frame_type = pict_type == 'D' ? X264_TYPE_IDR : X264_TYPE_I;
+                    rce->pict_type  = SLICE_TYPE_P;
+                    break;
                 case 'P':
                     rce->frame_type = X264_TYPE_P;
                     rce->pict_type  = SLICE_TYPE_P;
@@ -1521,6 +1538,56 @@ void x264_ratecontrol_start( x264_t *h, int i_force_qp, int overhead )
     if( i_force_qp != X264_QP_AUTO )
         q = i_force_qp - 1;
 
+    /* MVC: share actual buffer credit across views, not two permanently
+     * partitioned CPBs. The normal x264 frame-size estimator, lookahead,
+     * row-level VBV and QP bounds remain authoritative. Reserve credits
+     * before a frame thread begins macroblock processing; unused credits are
+     * returned at ratecontrol_end, where actual sizes are known. */
+    rc->mvc_shared_pending = rc->mvc_shared_failed = 0;
+    if( h->param.mvc_shared_vbv && rc->b_vbv )
+    {
+        double estimate = X264_MAX( rc->frame_size_planned, 2048. );
+        double allowance = 0;
+        int64_t order = h->i_frame;
+        if( x264_mvc_shared_vbv_reserve( h->param.mvc_shared_vbv, order,
+                h->param.mvc_view_index, estimate, &allowance ) )
+        {
+            rc->mvc_shared_failed = 1;
+            x264_log( h, X264_LOG_ERROR, "MVC shared VBV could not reserve frame %"PRId64"\n", order );
+        }
+        else
+        {
+            rc->mvc_shared_order = order;
+            rc->mvc_shared_pending = 1;
+            rc->mvc_shared_allowance = allowance;
+            /* The aggregate reservation used to affect only the initial QP.
+             * A mispredicted or complex row could therefore spend more bits
+             * than the two-eye CPB permits, and the ledger would reject the
+             * pair after it was too late to change the picture.  Bound the
+             * native row VBV ceiling as well.  Do NOT replace the native
+             * per-eye CPB fill: that created false QP=51 B-frame emergencies
+             * in earlier experimental builds. */
+            rc->frame_size_maximum = X264_MIN( rc->frame_size_maximum, allowance );
+            if( rc->frame_size_planned > allowance )
+            {
+                rc->frame_size_planned = allowance;
+                rc->frame_size_estimated = X264_MIN( rc->frame_size_estimated, allowance );
+            }
+            if( estimate > allowance )
+            {
+                /* Equivalent to x264's normal VBV Qscale adaptation:
+                 * raise QP to make the first-pass predicted frame fit. */
+                q += 6.0 * log2( estimate / allowance );
+            }
+            /* A shared reserve is an estimate, NOT the per-view CPB state.
+             * Previously replacing buffer_fill with a tiny speculative
+             * grant caused native row VBV to force B-pictures to QP 51
+             * even when both physical buffers had ample free space.
+             * The independent row-size ceiling above is applied without
+             * changing native CPB accounting. The ledger still checks
+             * actual completed stereo-pair sizes at ratecontrol_end. */
+        }
+    }
     q = x264_clip3f( q, h->param.rc.i_qp_min, h->param.rc.i_qp_max );
 
     rc->qpa_rc = rc->qpa_rc_prev =
@@ -1845,7 +1912,15 @@ int x264_ratecontrol_end( x264_t *h, int bits, int *filler )
 
     if( h->param.rc.b_stat_write )
     {
-        char c_type = h->sh.i_type==SLICE_TYPE_I ? (h->fenc->i_poc==0 ? 'I' : 'i')
+        /* MVC intra inter-view prediction keeps the temporal IDR/I picture
+         * but encodes its dependent slice as P.  A plain 'P' here made pass 2
+         * request P at each keyint boundary, forcing a corrective IDR and
+         * emitting "specified frame type (3)" warnings.  'D'/'d' encode the
+         * logical GOP type while the parser retains SLICE_TYPE_P for the
+         * measured rate-control cost, which was genuinely from a P slice. */
+        char c_type = h->b_mvc_intra_as_inter
+                    ? (h->fenc->i_type == X264_TYPE_IDR ? 'D' : 'd')
+                    : h->sh.i_type==SLICE_TYPE_I ? (h->fenc->i_poc==0 ? 'I' : 'i')
                     : h->sh.i_type==SLICE_TYPE_P ? 'P'
                     : h->fenc->b_kept_as_ref ? 'B' : 'b';
         int dir_frame = h->stat.frame.i_direct_score[1] - h->stat.frame.i_direct_score[0];
@@ -1987,6 +2062,26 @@ int x264_ratecontrol_end( x264_t *h, int bits, int *filler )
                                               h->fenc->hrd_timing.cpb_removal_time;
     }
 
+    if( rc->mvc_shared_failed )
+        return -1;
+    if( rc->mvc_shared_pending &&
+        x264_mvc_shared_vbv_settle( h->param.mvc_shared_vbv, rc->mvc_shared_order,
+            h->param.mvc_view_index, (double)bits + (double)(*filler) * 8. ) )
+    {
+        x264_mvc_vbv_failure_t detail = {0};
+        if( !x264_mvc_shared_vbv_failure( h->param.mvc_shared_vbv, &detail ) )
+            x264_log( h, X264_LOG_ERROR,
+                      "MVC combined VBV pair %"PRId64" failed (%s): before=%.0f refill=%.0f "
+                      "base=%.0f dependent=%.0f capacity=%.0f (all in bits)\n",
+                      detail.order, detail.reason, detail.before, detail.refill,
+                      detail.actual[0], detail.actual[1], detail.capacity );
+        else
+            x264_log( h, X264_LOG_ERROR,
+                      "MVC combined VBV pair %"PRId64" failed (ledger state unavailable)\n",
+                      rc->mvc_shared_order );
+        return -1;
+    }
+    rc->mvc_shared_pending = 0;
     return 0;
 fail:
     x264_log( h, X264_LOG_ERROR, "ratecontrol_end: stats file could not be written to\n" );
@@ -2451,6 +2546,9 @@ static float rate_estimate_qscale( x264_t *h )
 
         rcc->qp_novbv = q;
         q = qp2qscale( q );
+        if( rcc->b_2pass && h->param.mvc_joint_qscale &&
+            h->fenc->i_frame >= 0 && h->fenc->i_frame < h->param.mvc_joint_frames )
+            q *= h->param.mvc_joint_qscale[h->fenc->i_frame];
         if( rcc->b_2pass )
             rcc->frame_size_planned = qscale2bits( &rce, q );
         else
@@ -2518,6 +2616,9 @@ static float rate_estimate_qscale( x264_t *h )
                 double w = x264_clip3f( cur_time*100, 0.0, 1.0 );
                 q *= pow( (double)total_bits / rcc->expected_bits_sum, w );
             }
+            if( h->param.mvc_joint_qscale && h->fenc->i_frame >= 0 &&
+                h->fenc->i_frame < h->param.mvc_joint_frames )
+                q *= h->param.mvc_joint_qscale[h->fenc->i_frame];
             rcc->qp_novbv = qscale2qp( q );
             if( rcc->b_vbv )
             {

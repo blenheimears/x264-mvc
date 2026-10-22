@@ -535,6 +535,12 @@ typedef struct x264_param_t
     int b_mvc_inter_view_i;     /* allow anchor/intra picture to use base reference */
     int b_mvc_inter_view_p;     /* allow dependent P-slice base reference */
     int b_mvc_inter_view_b;     /* allow dependent B-slice base reference */
+    /* MVC pass-2 only: immutable presentation-order Q-scale correction table.
+     * Owned by the MVC CLI until both x264 encoder instances have closed. */
+    struct x264_mvc_shared_vbv_t *mvc_shared_vbv; /* borrowed; MVC only */
+    int mvc_view_index; /* 0: base, 1: dependent */
+    const float *mvc_joint_qscale;
+    int mvc_joint_frames;
     int b_vfr_input;            /* VFR input.  If 1, use timebase and timestamps for ratecontrol purposes.
                                  * If 0, use fps only. */
     int b_pulldown;             /* use explicitly set timebase for CFR */
