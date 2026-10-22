@@ -152,10 +152,12 @@ int x264_mvc_write_nals( FILE *out, const x264_nal_t *nals, int count,
             if( mvc_start(out) || mvc_write(out,&header,1) ||
                 mvc_write(out,mvc_hdr,3) || mvc_write(out,p+sc+1,n-sc-1) ) return -1;
         }
-        else if( type == 8 || type == 6 || type == 9 )
+        else if( type == 8 )
         {
             if( mvc_write( out, p, n ) ) return -1;
         }
+        /* The access unit delimiter and timing/user SEI belong to the base view only. */
+        else if( type == 6 || type == 9 ) continue;
         else return -1;
     }
     return 0;

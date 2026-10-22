@@ -20,6 +20,14 @@ typedef struct {
     int dependent_bitrate;
     int dependent_vbv_maxrate;
     int dependent_vbv_bufsize;
+    /* Combined two-view rate control. 0 disables it. */
+    int combined_bitrate;
+    int combined_vbv_maxrate;
+    int combined_vbv_bufsize;
+    float dependent_crf_offset;
+    int view_vbv_maxrate_cap;
+    int view_vbv_bufsize_cap;
+    const char *rc_trace_filename;
 } x264_mvc_cli_opts_t;
 /* Returns 0 (picture read), 1 (EOF), -1 (read error). */
 typedef int (*x264_mvc_read_picture)( void *opaque, x264_picture_t *picture, int64_t frame, int right );

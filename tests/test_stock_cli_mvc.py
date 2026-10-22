@@ -109,7 +109,8 @@ with tempfile.TemporaryDirectory(prefix='x264-mvc-cli-') as work:
     tuned_dep = d/'tuned-dependent.mvc'
     common = ['--mvc','--preset','veryfast','--bitrate','400','--vbv-maxrate','600',
               '--vbv-bufsize','800','--frames','12','--keyint','6','--bframes','2']
-    invoke(*common,'-o',baseline_base,'--mvc-dependent',baseline_dep,sbs)
+    invoke(*common,'--mvc-dependent-bitrate','400','--mvc-dependent-vbv-maxrate','600',
+           '--mvc-dependent-vbv-bufsize','800','-o',baseline_base,'--mvc-dependent',baseline_dep,sbs)
     invoke(*common,'--mvc-dependent-bitrate','120','--mvc-dependent-vbv-maxrate','240',
            '--mvc-dependent-vbv-bufsize','320','-o',tuned_base,'--mvc-dependent',tuned_dep,sbs)
     assert tuned_base.read_bytes() == baseline_base.read_bytes(), 'dependent RC altered AVC base'
@@ -123,4 +124,26 @@ with tempfile.TemporaryDirectory(prefix='x264-mvc-cli-') as work:
     invoke('--mvc','--mvc-layout','separate','-o',d/'bad2.264',left,ok=False)
     invoke('--mvc','--mvc-layout','sbs','--mvc-dependent',d/'bad.mvc',
            '-o',d/'bad.mkv',sbs,ok=False)
+    long_sbs = d/'long.y4m'
+    make_y4m(long_sbs, 128, 64, 48)
+    # Combined rate control: bitrate tolerance, VBV never exceeded, per-view split not fixed.
+    trace = d/'rc.csv'
+    invoke('--mvc','--preset','veryfast','--bitrate','300','--vbv-maxrate','600','--vbv-bufsize','600',
+           '--frames','48','--keyint','12','--bframes','2','--mvc-rc-trace',trace,'-o',d/'rc.264',long_sbs)
+    rows = [l.split(',') for l in trace.read_text().splitlines()[1:]]
+    assert len(rows) == 48, 'trace row per access unit'
+    assert min(float(r[5]) for r in rows) >= 0, 'combined VBV underflow'
+    invoke('--mvc','--bitrate','300','--mvc-dependent-bitrate','100','--mvc-combined-bitrate','300',
+           '-o',d/'mix.264',sbs,ok=False)
+    invoke('--mvc','--mvc-dependent-crf-offset','3','--bitrate','300','--frames','12','-o',d/'off.264',sbs)
+
+    # Two-pass: per-view statistics, first pass must precede second.
+    stats = d/'mv.log'
+    two = ['--mvc','--preset','veryfast','--bitrate','300','--frames','24','--keyint','12','--bframes','2']
+    invoke(*two,'--pass','2','--stats',stats,'-o',d/'x.264',long_sbs,ok=False)
+    invoke(*two,'--pass','1','--stats',stats,'-o',d/'p1.264',long_sbs)
+    assert (d/'mv.log.mvc').exists() and (d/'mv.log.base').exists() and (d/'mv.log.dep').exists()
+    invoke(*two,'--pass','2','--stats',stats,'-o',d/'p2.264',long_sbs)
+    check_two = nal_units((d/'p2.264').read_bytes())
+    assert sum((n[0]&31)==20 for n in check_two) == 24
 print('x264 stock CLI/MVC smoke suite passed')

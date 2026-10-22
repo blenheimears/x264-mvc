@@ -87,6 +87,11 @@ x264 --mvc --mvc-no-inter --mvc-inter-p \
 | `--mvc-inter-i`, `--mvc-no-inter-i` | Enable/disable inter-view prediction for dependent I/IDR |
 | `--mvc-inter-p`, `--mvc-no-inter-p` | Enable/disable prediction for dependent P |
 | `--mvc-inter-b`, `--mvc-no-inter-b` | Enable/disable prediction for dependent B |
+| `--mvc-combined-bitrate`, `--mvc-combined-vbv-maxrate`, `--mvc-combined-vbv-bufsize` | Combined targets for both views (stock `--bitrate`, `--vbv-maxrate`, `--vbv-bufsize` mean the same) |
+| `--mvc-dependent-bitrate`, `--mvc-dependent-vbv-maxrate`, `--mvc-dependent-vbv-bufsize` | Independent dependent-view rate control; stock rate options then apply to the base view only. Cannot be mixed with the combined options |
+| `--mvc-dependent-crf-offset` | CRF offset of the dependent view under combined rate control |
+| `--mvc-view-vbv-maxrate`, `--mvc-view-vbv-bufsize` | Upper limits for each view's VBV when combined rate control divides the budget (e.g. Blu-ray per-view limits) |
+| `--mvc-rc-trace FILE` | Per-access-unit rate-control CSV |
 
 All inter-view prediction is **enabled by default**, and flags are processed
 in their command-line order. The plain x264 `--frames` flag counts stereo
@@ -108,7 +113,7 @@ is explicitly supplied. Standard `--seek` counts pairs when MVC is active.
   ready for the dependent encoder, potentially lowering overall throughput.
 * `--qpfile`, pulldown, timecode output, VFR, and interlaced encoding are not
   supported in MVC mode. Ordinary 2D modes keep stock support. MVC two-pass
-  mode is not yet implemented safely; independent eye stats would be needed.
+  supports `--pass 1` and `--pass 2` with per-view statistics files.
 * A dependent view I/IDR that uses inter-view prediction is coded as an MVC
   P-slice, referencing the already reconstructed base picture. Consumer
   hardware acceptance of that mode remains **unverified**.

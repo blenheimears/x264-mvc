@@ -993,7 +993,13 @@ static void help( x264_param_t *defaults, int longhelp )
     H0( "      --mvc-dependent-bitrate <kbps>      Dependent-view ABR target (default: base target)\n" );
     H0( "      --mvc-dependent-vbv-maxrate <kbps>  Dependent-view VBV peak (default: base peak)\n" );
     H0( "      --mvc-dependent-vbv-bufsize <kbit>  Dependent-view VBV buffer (default: base buffer)\n" );
-    H0( "      --mvc-no-inter            Disable cross-view prediction for all picture types\n" );
+    H0( "      --mvc-combined-bitrate <kbps>       Total target for both views (same as --bitrate)\n" );
+    H0( "      --mvc-combined-vbv-maxrate <kbps>   Combined VBV peak, divided between the views by demand\n" );
+    H0( "      --mvc-combined-vbv-bufsize <kbit>   Combined VBV buffer, divided between the views by demand\n" );
+    H0( "      --mvc-view-vbv-maxrate <kbps>       Upper limit of either view's VBV peak\n" );
+    H0( "      --mvc-view-vbv-bufsize <kbit>       Upper limit of either view's VBV buffer\n" );
+    H0( "      --mvc-dependent-crf-offset <float>  CRF offset of the dependent view (default 0)\n" );
+    H0( "      --mvc-rc-trace <path>               Write a per-access-unit rate-control CSV\n" );    H0( "      --mvc-no-inter            Disable cross-view prediction for all picture types\n" );
     H0( "      --mvc-inter               Enable cross-view prediction for all types (default)\n" );
     H0( "      --mvc-no-inter-i/p/b      Disable I, P, or B cross-view prediction individually\n" );
     H0( "      --mvc-inter-i/p/b         Re-enable I, P, or B individually\n" );
@@ -1048,7 +1054,14 @@ typedef enum
     OPT_MVC_INTER_B,
     OPT_MVC_NO_INTER_I,
     OPT_MVC_NO_INTER_P,
-    OPT_MVC_NO_INTER_B
+    OPT_MVC_NO_INTER_B,
+    OPT_MVC_COMBINED_BITRATE,
+    OPT_MVC_COMBINED_VBV_MAXRATE,
+    OPT_MVC_COMBINED_VBV_BUFSIZE,
+    OPT_MVC_DEPENDENT_CRF_OFFSET,
+    OPT_MVC_RC_TRACE,
+    OPT_MVC_VIEW_VBV_MAXRATE,
+    OPT_MVC_VIEW_VBV_BUFSIZE
 } OptionsOPT;
 
 static char short_options[] = "8A:B:b:f:hI:i:m:o:p:q:r:t:Vvw";
@@ -1069,6 +1082,13 @@ static struct option long_options[] =
     { "mvc-no-inter-i",       no_argument,       NULL, OPT_MVC_NO_INTER_I },
     { "mvc-no-inter-p",       no_argument,       NULL, OPT_MVC_NO_INTER_P },
     { "mvc-no-inter-b",       no_argument,       NULL, OPT_MVC_NO_INTER_B },
+    { "mvc-combined-bitrate", required_argument, NULL, OPT_MVC_COMBINED_BITRATE },
+    { "mvc-combined-vbv-maxrate", required_argument, NULL, OPT_MVC_COMBINED_VBV_MAXRATE },
+    { "mvc-combined-vbv-bufsize", required_argument, NULL, OPT_MVC_COMBINED_VBV_BUFSIZE },
+    { "mvc-dependent-crf-offset", required_argument, NULL, OPT_MVC_DEPENDENT_CRF_OFFSET },
+    { "mvc-rc-trace",         required_argument, NULL, OPT_MVC_RC_TRACE },
+    { "mvc-view-vbv-maxrate", required_argument, NULL, OPT_MVC_VIEW_VBV_MAXRATE },
+    { "mvc-view-vbv-bufsize", required_argument, NULL, OPT_MVC_VIEW_VBV_BUFSIZE },
     { "help",                 no_argument,       NULL, 'h' },
     { "longhelp",             no_argument,       NULL, OPT_LONGHELP },
     { "fullhelp",             no_argument,       NULL, OPT_FULLHELP },
@@ -1393,7 +1413,7 @@ static int init_vid_filters( char *sequence, hnd_t *handle, video_info_t *info, 
     int csp = info->csp & X264_CSP_MASK;
     if( output_csp == X264_CSP_I400 && csp != X264_CSP_I400 )
         param->i_csp = X264_CSP_I400;
-    else if( output_csp == X264_CSP_I420 && (csp < X264_CSP_I420 || csp >= X264_CSP_I422) )
+    else if( output_csp == X264_CSP_I420 && csp != X264_CSP_I420 )
         param->i_csp = X264_CSP_I420;
     else if( output_csp == X264_CSP_I422 && (csp < X264_CSP_I422 || csp >= X264_CSP_I444) )
         param->i_csp = X264_CSP_I422;
@@ -1564,6 +1584,46 @@ static int parse( int argc, char **argv, x264_param_t *param, cli_opt_t *opt )
             case OPT_MVC_NO_INTER_I: b_mvc_option = 1; opt->mvc.prediction_mask &= ~1U; break;
             case OPT_MVC_NO_INTER_P: b_mvc_option = 1; opt->mvc.prediction_mask &= ~2U; break;
             case OPT_MVC_NO_INTER_B: b_mvc_option = 1; opt->mvc.prediction_mask &= ~4U; break;
+            case OPT_MVC_COMBINED_BITRATE:
+            case OPT_MVC_COMBINED_VBV_MAXRATE:
+            case OPT_MVC_COMBINED_VBV_BUFSIZE:
+            {
+                char *end = NULL;
+                long value = strtol( optarg, &end, 10 );
+                if( errno || !optarg[0] || *end || value < 1 || value > 1000000 ) { FAIL_IF_ERROR( 1, "invalid MVC combined setting `%s'\n", optarg ); break; }
+                b_mvc_option = 1;
+                if( c == OPT_MVC_COMBINED_BITRATE ) opt->mvc.combined_bitrate = value;
+                else if( c == OPT_MVC_COMBINED_VBV_MAXRATE ) opt->mvc.combined_vbv_maxrate = value;
+                else opt->mvc.combined_vbv_bufsize = value;
+                break;
+            }
+            case OPT_MVC_DEPENDENT_CRF_OFFSET:
+            {
+                char *end = NULL;
+                double value;
+                errno = 0;
+                value = strtod( optarg, &end );
+                FAIL_IF_ERROR( errno || !optarg[0] || *end || value < -20 || value > 20,
+                               "invalid MVC dependent CRF offset `%s'\n", optarg );
+                b_mvc_option = 1;
+                opt->mvc.dependent_crf_offset = (float)value;
+                break;
+            }
+            case OPT_MVC_VIEW_VBV_MAXRATE:
+            case OPT_MVC_VIEW_VBV_BUFSIZE:
+            {
+                char *end = NULL;
+                long value;
+                errno = 0;
+                value = strtol( optarg, &end, 10 );
+                FAIL_IF_ERROR( errno || !optarg[0] || *end || value < 1 || value > 1000000,
+                               "invalid MVC per-view VBV cap `%s'\n", optarg );
+                b_mvc_option = 1;
+                if( c == OPT_MVC_VIEW_VBV_MAXRATE ) opt->mvc.view_vbv_maxrate_cap = value;
+                else opt->mvc.view_vbv_bufsize_cap = value;
+                break;
+            }
+            case OPT_MVC_RC_TRACE: b_mvc_option = 1; opt->mvc.rc_trace_filename = optarg; break;
             case 'o':
                 output_filename = optarg;
                 break;
@@ -1720,8 +1780,8 @@ generic_option:
 
     FAIL_IF_ERROR( opt->mvc.enabled && profile && strcasecmp( profile, "high" ),
                    "MVC requires --profile high\n" );
-    FAIL_IF_ERROR( opt->mvc.enabled && (param->rc.b_stat_read || param->rc.b_stat_write),
-                   "MVC two-pass encoding needs separate per-eye stats and is not implemented yet\n" );
+    FAIL_IF_ERROR( opt->mvc.enabled && param->rc.b_stat_write && param->rc.b_stat_read,
+                   "MVC multi-pass encoding supports only --pass 1 and --pass 2\n" );
 
     /* Get the file name */
     FAIL_IF_ERROR( optind > argc - 1 || !output_filename, "No %s file. Run x264 --help for a list of options.\n",
@@ -2097,11 +2157,12 @@ static int mvc_read_picture( void *opaque, x264_picture_t *dst, int64_t index, i
     x264_picture_init( &pic );
     convert_cli_to_lib_pic( &pic, &source );
     if( (pic.img.i_csp & X264_CSP_MASK) != X264_CSP_I420 ||
-        (pic.img.i_csp & X264_CSP_HIGH_DEPTH) || pic.img.i_plane != 3 )
+        (pic.img.i_csp & X264_CSP_HIGH_DEPTH) || pic.img.i_plane < 3 )
     {
         f->release_frame( hin, &source, source_index );
         return -1;
     }
+    pic.img.i_plane = 3;
     /* The caller allocates a full-sized source picture. Strides may differ
      * due to SIMD alignment; the configured width, not the stride, is copied. */
     int height = right ? opt->mvc_right_height : opt->mvc_source_height;
