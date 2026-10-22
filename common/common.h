@@ -416,7 +416,6 @@ struct x264_t
 
     /* Single decoded base-eye view component for the current MVC access unit.
      * It is NOT placed into frames.reference: that buffer is the temporal DPB. */
-    x264_frame_t    *mvc_inter_ref;
     int              b_mvc_intra_as_inter; /* original I/IDR pictures emitted as dependent P */
 
     /* references lists */
@@ -760,6 +759,13 @@ struct x264_t
     x264_quant_function_t quantf;
     x264_deblock_function_t loopf;
     x264_bitstream_function_t bsf;
+
+    /* Per-frame-thread MVC reference; intentionally outside thread_sync_context's
+     * copied region. Shared input queue exists only on thread[0] and is only
+     * manipulated by the encoder API thread, never by a slice worker. */
+    x264_frame_t *mvc_inter_ref;
+    struct x264_mvc_ref_node_t *mvc_ref_queue;
+    int mvc_ref_queue_size;
 
     x264_lookahead_t *lookahead;
 
